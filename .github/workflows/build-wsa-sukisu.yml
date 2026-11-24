@@ -1,0 +1,212 @@
+# WSA 内核 + SukiSU Nova 自动构建
+#
+# - 定时：每天检查 SukiSU Nova 的最新稳定版（GitHub "Latest release"，不含预发布），
+#         本仓库还没有对应 Release 时自动编译并发布
+# - 手动：Actions → 本工作流 → Run workflow，可指定任意 tag / 分支 / commit
+name: Build WSA Kernel - SukiSU Nova
+
+on:
+  schedule:
+    - cron: "37 3 * * *"        # 每天 UTC 03:37（马来西亚时间 11:37）
+  workflow_dispatch:
+    inputs:
+      sukisu_ref:
+        description: "SukiSU Nova 的 tag / 分支 / commit（留空 = 最新稳定版）"
+        default: ""
+        required: false
+      kernel_tag:
+        description: "WSA-Linux-Kernel 版本 (WSA 2407 = 5.15.104.4)"
+        default: "5.15.104.4"
+        required: true
+      enable_kpm:
+        description: "开启 KPM (实验性)"
+        type: boolean
+        default: false
+      force:
+        description: "已有同名 Release 也重新编译并覆盖"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  UPSTREAM: SukiSU-Nova/SukiSU-Nova
+  DEFAULT_KERNEL_TAG: "5.15.104.4"
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      sukisu_ref: ${{ steps.r.outputs.sukisu_ref }}
+      kernel_tag: ${{ steps.r.outputs.kernel_tag }}
+      kpm: ${{ steps.r.outputs.kpm }}
+      release_tag: ${{ steps.r.outputs.release_tag }}
+      build: ${{ steps.r.outputs.build }}
+    steps:
+      - name: Decide what to build
+        id: r
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IN_REF: ${{ inputs.sukisu_ref }}
+          IN_KERNEL: ${{ inputs.kernel_tag }}
+          IN_KPM: ${{ inputs.enable_kpm }}
+          IN_FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          REF="${IN_REF:-}"
+          if [ -z "$REF" ]; then
+            # /releases/latest 只返回正式版，自动跳过 pre-release 和 draft
+            REF=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+            echo "上游最新稳定版: $REF"
+            if ! [[ "$REF" =~ ^v[0-9] ]]; then
+              echo "::warning::最新 Release 的 tag '$REF' 不是版本号格式，跳过"
+              echo "build=false" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+          fi
+          KERNEL="${IN_KERNEL:-$DEFAULT_KERNEL_TAG}"
+          KPM=$([ "${IN_KPM:-false}" = "true" ] && echo true || echo false)
+          SUFFIX=$([ "$KPM" = true ] && echo "-KPM" || true)
+          TAG="WSA-${KERNEL}-SukiSU-${REF}${SUFFIX}"
+
+          BUILD=true
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 && [ "${IN_FORCE:-false}" != "true" ]; then
+            echo "Release $TAG 已存在，无需构建"
+            BUILD=false
+          fi
+          {
+            echo "sukisu_ref=$REF"
+            echo "kernel_tag=$KERNEL"
+            echo "kpm=$KPM"
+            echo "release_tag=$TAG"
+            echo "build=$BUILD"
+          } >> "$GITHUB_OUTPUT"
+          echo "### $TAG → build=$BUILD" >> "$GITHUB_STEP_SUMMARY"
+
+      # 仓库 60 天没有活动时 GitHub 会自动停用定时任务，这一步防止被停用
+      - name: Keep scheduled workflow alive
+        if: github.event_name == 'schedule'
+        uses: liskin/gh-workflow-keepalive@v1
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: build-${{ needs.resolve.outputs.release_tag }}
+      cancel-in-progress: false
+    env:
+      SUKISU_REF: ${{ needs.resolve.outputs.sukisu_ref }}
+      KERNEL_TAG: ${{ needs.resolve.outputs.kernel_tag }}
+      KPM: ${{ needs.resolve.outputs.kpm }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+    steps:
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libelf-dev libssl-dev clang lld llvm cpio xz-utils
+
+      - name: Checkout WSA kernel
+        run: |
+          git clone --depth 1 -b "android-lts/latte-2/$KERNEL_TAG" \
+            https://github.com/microsoft/WSA-Linux-Kernel WSA-Linux-Kernel
+
+      - name: Checkout SukiSU Nova (full history, needed for version number)
+        run: |
+          git clone "https://github.com/$UPSTREAM" SukiSU
+          cd SukiSU && git checkout "$SUKISU_REF"
+          # 版本号按本地 main 的提交数计算，把 main 指到所选 ref，版本号才和官方该版本一致
+          git branch -f main HEAD
+          # 防止 git describe 取到 manager-ci 之类的非版本 tag
+          git tag -l | grep -v '^v[0-9]' | xargs -r git tag -d
+
+      - name: Integrate SukiSU into kernel
+        working-directory: WSA-Linux-Kernel
+        run: |
+          ln -sf "$GITHUB_WORKSPACE/SukiSU/kernel" drivers/kernelsu
+          grep -q kernelsu drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+
+      - name: Configure
+        working-directory: WSA-Linux-Kernel
+        run: |
+          cp configs/wsa/config-wsa-x64 .config
+          {
+            echo CONFIG_KSU=y
+            # WSA 5.15 内核没有 x86 indirect syscall 绕过补丁，必须开这个
+            echo CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y
+            if [ "$KPM" = "true" ]; then echo CONFIG_KPM=y; else echo '# CONFIG_KPM is not set'; fi
+          } >> .config
+          make LLVM=1 ARCH=x86_64 olddefconfig
+          grep -E '^CONFIG_KSU|^CONFIG_KPM' .config
+
+      - name: Build bzImage
+        working-directory: WSA-Linux-Kernel
+        env:
+          KSU_BUILD_REF: ${{ needs.resolve.outputs.sukisu_ref }}
+        run: |
+          # preinit 需要 usr/include
+          make LLVM=1 ARCH=x86_64 headers
+          # GITHUB_COMMITS= / KSU_GITHUB_VER= 让版本号用本地 git 计算而不是在线查 main
+          # LOCALVERSION= 去掉版本串末尾的 "+"，与原版 WSA 内核一致
+          make -j"$(nproc)" LLVM=1 ARCH=x86_64 GITHUB_COMMITS= KSU_GITHUB_VER= LOCALVERSION= bzImage
+
+      - name: Package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir out
+          cp WSA-Linux-Kernel/arch/x86/boot/bzImage out/kernel
+          (cd out && sha256sum kernel > kernel.sha256)
+          UNAME=$(strings WSA-Linux-Kernel/vmlinux | grep -m1 'Linux version' || true)
+          # 附上同版本的管理器 APK：优先 x86_64，没有再用 universal（文件名带 universal 或不带任何 ABI 标记）
+          APKS=$(gh release view "$SUKISU_REF" -R "$UPSTREAM" --json assets \
+                   --jq '.assets[].name | select(endswith(".apk"))' 2>/dev/null || true)
+          PICK=$(printf '%s\n' "$APKS" | grep -iE 'x86[_-]?64|x64' | head -n1 || true)
+          [ -n "$PICK" ] || PICK=$(printf '%s\n' "$APKS" | grep -i 'universal' | head -n1 || true)
+          [ -n "$PICK" ] || PICK=$(printf '%s\n' "$APKS" | grep -viE 'arm|aarch|x86|v7a|v8a|mips' | grep . | head -n1 || true)
+          if [ -n "$PICK" ]; then
+            gh release download "$SUKISU_REF" -R "$UPSTREAM" -p "$PICK" -D out
+            APK_LINE="管理器 APK：\`$PICK\`（已附在本 Release）"
+          else
+            echo "::warning::上游 $SUKISU_REF 没有 x86_64 或 universal 的 APK，未附带管理器"
+            APK_LINE="管理器 APK：上游没有提供 x86_64 / universal 版本，请到 [SukiSU Nova Releases](https://github.com/$UPSTREAM/releases/tag/$SUKISU_REF) 自行下载"
+          fi
+          cat > notes.md <<EOF
+          WSA 内核 \`$KERNEL_TAG\` (x64) + SukiSU Nova \`$SUKISU_REF\`$([ "$KPM" = true ] && echo ' + KPM')
+
+          \`\`\`
+          $UNAME
+          SHA256 (kernel): $(cut -d' ' -f1 out/kernel.sha256)
+          \`\`\`
+
+          $APK_LINE
+
+          **安装 / 更新**
+          1. 在 WSA 设置里关闭 WSA
+          2. 把 WSA 目录里的 \`Tools\\kernel\` 改名备份
+          3. 放入本 Release 的 \`kernel\`，再启动 WSA
+          4. 安装同版本的 SukiSU Nova 管理器（附件里有就用附件里的）
+
+          回滚：把备份改回 \`kernel\` 即可。
+          EOF
+          ls -l out
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.resolve.outputs.release_tag }}
+          path: out/
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" out/* --clobber -R "$GITHUB_REPOSITORY"
+            gh release edit "$RELEASE_TAG" --notes-file notes.md -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_TAG" out/* -R "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "$RELEASE_TAG" --notes-file notes.md --latest
+          fi
