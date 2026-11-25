@@ -22,9 +22,11 @@ SukiSU Nova 发布新的稳定版后，本仓库会通过 GitHub Actions 自动�
 - [完整安装流程（GApps + SukiSU，不带 Magisk）](#完整安装流程gapps--sukisu不带-magisk)
 - [更新 SukiSU](#更新-sukisu)
 - [挂载模块（metamodule）兼容性](#挂载模块metamodule兼容性)
+- [Zygisk](#zygisk)
 - [常见问题](#常见问题)
 - [自动构建与手动构建](#自动构建与手动构建)
 - [tools/](#tools)
+- [免责声明](#免责声明)
 - [致谢](#致谢)
 
 ---
@@ -96,7 +98,7 @@ SukiSU Nova v3 和 KernelSU 3.x 一样，**自己不负责挂载模块**，而�
 adb push meta-overlayfs-vX.X.X.zip /sdcard/Download/
 ```
 
-在管理器里依次点：模块 → ＋ → 选择这个 zip，然后**重启 WSA**。在 WSA 上，管理器里的"重启"通常等于关机，关掉之后从开始菜单重新打开就行。
+在管理器里依次点：模块 → ＋ → 选择这个 zip，然后**重启 WSA**。可以直接点管理器里的"重启"，也可以在 WSA 设置里点"关闭"再重新打开。
 
 ### 5. 安装 GApps 模块
 
@@ -115,7 +117,30 @@ adb shell getprop ro.build.fingerprint
 - 第一条应该能看到 `com.android.vending` 和 `com.google.android.gms`
 - 第二条的输出应该以 `google/` 开头
 
-最后从开始菜单打开 **Google Play 商店** 登录。首次登录时闪退一两次是正常的，重新打开即可。
+### 6. 让 Windows 开始菜单出现 Play 商店
+
+刚装好模块时，Windows 里**搜不到** Play 商店。原因是 GApps 是开机时由模块挂进系统的，WSA 没有收到"应用已安装"的通知，就不会生成快捷方式。
+
+解决办法是把 Play 商店原样覆盖安装一次：
+
+```bat
+adb shell pm path com.android.vending
+adb pull /product/priv-app/Phonesky/Phonesky.apk
+adb install -r Phonesky.apk
+```
+
+第一条命令会显示 APK 的实际路径。如果和第二条里的路径不一样，按显示的改。装完后，开始菜单和 Windows 搜索里就能找到 **Google Play 商店** 了。效果和 Play 商店自己更新一次一样；想恢复原样，可以运行 `adb shell pm uninstall-system-updates com.android.vending`。
+
+在快捷方式出现之前，也可以先用这个命令打开 Play 商店：
+
+```
+%LOCALAPPDATA%\Microsoft\WindowsApps\MicrosoftCorporationII.WindowsSubsystemForAndroid_8wekyb3d8bbwe\WsaClient.exe /launch wsa://com.android.vending
+```
+
+最后打开 Play 商店登录。首次登录时闪退一两次是正常的，重新打开即可。
+
+> [!CAUTION]
+> **不要开启 SukiSU Nova 内置的 NyaZygisk。** 开启后 Play 服务（GMS）不会启动，Play 商店会一直卡在 logo 页面。需要 Zygisk 的话请看下面的 [Zygisk](#zygisk) 一节。
 
 ---
 
@@ -149,14 +174,30 @@ WSA 内核开启了 `CONFIG_OVERLAY_FS`、`CONFIG_TMPFS_XATTR` 和 `CONFIG_MODUL
 
 ---
 
+## Zygisk
+
+| Zygisk 实现 | 搭配 GApps 的测试结果 |
+|---|---|
+| SukiSU Nova 内置的 **NyaZygisk** | ❌ Play 服务（GMS）起不来，Play 商店卡在 logo 页面 |
+| **ZygiskNext**（以模块形式安装） | ✅ 实测可用，Play 商店正常 |
+| 其他（ReZygisk、NeoZygisk 等） | 未测试 |
+
+- 同一时间只能启用一个 Zygisk 实现。装 ZygiskNext 之前，先在管理器里关掉 NyaZygisk。
+- 不用 Zygisk 模块（LSPosed、Shamiko 之类）的话，就不需要开启任何 Zygisk。
+- 很多 Zygisk 模块只提供 ARM 版本的库，在 x86_64 的 WSA 上不会生效，装之前先确认模块支持 x86_64。
+
+---
+
 ## 常见问题
 
 | 现象 | 处理 |
 |---|---|
 | 换内核后 WSA 起不来 | 把 `Tools\kernel_origin` 改回 `kernel` 就能恢复，Userdata 不受影响。也欢迎提 Issue |
 | SukiSU 模块页提示和 Magisk 冲突 | 你用的 WSA 包自带 Magisk（GApps 包都带）。请改用 NoGApps NoAmazon 包，按上面的流程重装 |
-| 刷了 GApps 模块，但看不到 Play 商店 | metamodule 没装或没生效。在管理器里确认它已启用，然后重启 WSA |
-| Play 服务反复闪退 | 先关掉 Zygisk（如 NyaZygisk）排查；还不行就禁用 GApps 模块：`adb shell su -c "touch /data/adb/modules/lsp_gapps/disable"`，然后重启 WSA |
+| `pm list packages` 里没有 vending / gms | metamodule 没装或没生效。在管理器里确认它已启用，然后重启 WSA |
+| 包名有，但 Windows 搜不到 Play 商店 | 按[第 6 步](#6-让-windows-开始菜单出现-play-商店)覆盖安装一次 Play 商店 |
+| Play 商店卡在 logo 页面 | 运行 `adb shell "ps -A \| grep gms"`：没有 GMS 进程的话，多半是开了 NyaZygisk。关掉它，重启 WSA；需要 Zygisk 请改用 ZygiskNext |
+| Play 服务反复闪退 | 先关掉所有 Zygisk 排查；还不行就禁用 GApps 模块：`adb shell su -c "touch /data/adb/modules/lsp_gapps/disable"`，然后重启 WSA |
 | arm64 应用闪退 | 走的是 Libhoudini 转译，和内核无关。请使用 LTS_8 或更新的 WSA 包，能选 x86_64 版本的应用尽量选 x86_64 |
 
 ---
@@ -193,8 +234,10 @@ WSA 内核开启了 `CONFIG_OVERLAY_FS`、`CONFIG_TMPFS_XATTR` 和 `CONFIG_MODUL
 
 把 LSPosed [WSA-Addon](https://github.com/LSPosed/WSA-Addon) 里的 `gapps-13.0-*.img` 和 `cust.img`（也就是 WSABuilds GApps 包里那两个 "GApps for WSA" 和 "WSA Customization" 模块），转换成 KernelSU / SukiSU 可以直接刷入的模块 zip。
 
+需要在 Linux 下运行，Windows 用户可以用 WSL（Debian / Ubuntu）：
+
 ```bash
-# Debian / Ubuntu
+# Debian / Ubuntu / WSL
 sudo apt install curl erofs-utils zip
 ./tools/repack_wsa_addon_for_ksu.sh          # 默认 x86_64
 ./tools/repack_wsa_addon_for_ksu.sh arm64    # ARM 设备上的 WSA
@@ -203,6 +246,18 @@ sudo apt install curl erofs-utils zip
 运行后会在当前目录生成 `lsp_gapps-ksu.zip` 和 `lsp_cust-ksu.zip`。
 
 原版模块里用 `model.prop` 把设备指纹的品牌改成 `google`，转换后这一步改由模块的 `post-fs-data.sh` 调用 `resetprop` 完成，效果一样。
+
+> [!NOTE]
+> 本仓库**不直接提供**转换好的 zip。GApps 里是 Google 的闭源应用，不适合从这里二次分发，所以只提供转换脚本：脚本从 LSPosed 官方 Release 下载原文件，然后在你自己的电脑上完成转换。
+
+---
+
+## 免责声明
+
+- 本仓库只发布用 Microsoft 公开的 GPL-2.0 内核源码和 SukiSU Nova 源码编译出的内核，以及上游原样的管理器 APK，**不包含也不分发 WSA 本体或 Google 应用**。每个 Release 的源码就是工作流里写明的 WSA-Linux-Kernel tag 和 SukiSU Nova tag。
+- 修改 WSA、使用 root、在未经认证的设备上使用 Google 服务，都可能违反相关软件的许可条款或服务条款，并可能导致账号或应用受到限制，请自行评估并承担风险。
+- WSA 已于 2025 年 3 月停止支持，不会再有官方的安全更新。
+- 本项目与 Microsoft、Google、WSABuilds、LSPosed、SukiSU 均无关联，"Windows Subsystem for Android" 等名称是其各自所有者的商标。
 
 ---
 
